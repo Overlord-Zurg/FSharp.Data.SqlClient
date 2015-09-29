@@ -40,9 +40,10 @@ type public SqlEnumProvider(config : TypeProviderConfig) as this =
                 ProvidedStaticParameter("Provider", typeof<string>, "System.Data.SqlClient") 
                 ProvidedStaticParameter("ConfigFile", typeof<string>, "") 
                 ProvidedStaticParameter("CLIEnum", typeof<bool>, false) 
+                ProvidedStaticParameter("UseCamelCaseNames", typeof<bool>, false)
             ],             
             instantiationFunction = (fun typeName args ->   
-                cache.GetOrAdd(typeName, lazy this.CreateRootType(typeName, unbox args.[0], unbox args.[1], unbox args.[2], unbox args.[3], unbox args.[4]))
+                cache.GetOrAdd(typeName, lazy this.CreateRootType(typeName, unbox args.[0], unbox args.[1], unbox args.[2], unbox args.[3], unbox args.[4], unbox args.[5]))
             )        
         )
 
@@ -53,11 +54,12 @@ type public SqlEnumProvider(config : TypeProviderConfig) as this =
 <param name='Provider'>Invariant name of a ADO.NET provider. Default is "System.Data.SqlClient".</param>
 <param name='ConfigFile'>The name of the configuration file that’s used for connection strings at DESIGN-TIME. The default value is app.config or web.config.</param>
 <param name='CLIEnum'>Generate standard CLI Enum. Default is false.</param>
+<param name='UseCamelCaseNames'>Cause names of generated members to be reformatted as UpperCamelCase. Default is false.</param>
 """
 
         this.AddNamespace( nameSpace, [ providerType ])
     
-    member internal this.CreateRootType( typeName, query, connectionStringOrName, provider, configFile, cliEnum) = 
+    member internal this.CreateRootType( typeName, query, connectionStringOrName, provider, configFile, cliEnum, useCamelCaseNames) = 
         let tempAssembly = ProvidedAssembly( Path.ChangeExtension(Path.GetTempFileName(), ".dll"))
 
         let providedEnumType = ProvidedTypeDefinition(assembly, nameSpace, typeName, baseType = Some typeof<obj>, HideObjectMethods = true, IsErased = false)
@@ -117,7 +119,7 @@ type public SqlEnumProvider(config : TypeProviderConfig) as this =
                 
                 tupleType, getValue
 
-        let names, values = 
+        let baseNames, values = 
             [ 
                 while reader.Read() do 
                     let rowValues = Array.zeroCreate reader.FieldCount
@@ -128,6 +130,23 @@ type public SqlEnumProvider(config : TypeProviderConfig) as this =
                     yield label, value
             ] 
             |> List.unzip
+
+        let toUpperCamelCase (str: string) = if String.IsNullOrWhiteSpace(str) then ""
+                                             else str.Substring(0, 1).ToUpper() + str.Substring(1).ToLower()
+        let regexNoPunctuation = new System.Text.RegularExpressions.Regex("[a-zA-Z_][a-zA-Z0-9_]*")
+
+        let names = baseNames
+                    |> if useCamelCaseNames then
+                           List.map (fun name -> let nameWords = name.Split([|' '|])
+                                                 let camelCaseWords =
+                                                     match nameWords with
+                                                     | [||] -> failwith "Something didn't have a name."
+                                                     | _ -> nameWords |> Array.map toUpperCamelCase
+                                                 let camelCaseName = String.Join("", camelCaseWords)
+                                                 if regexNoPunctuation.IsMatch(camelCaseName) then camelCaseName
+                                                 else failwithf "The name %s contains illegal characters and cannot be parsed into camel case." camelCaseName
+                                                 )
+                       else id
 
         names 
         |> Seq.groupBy id 
