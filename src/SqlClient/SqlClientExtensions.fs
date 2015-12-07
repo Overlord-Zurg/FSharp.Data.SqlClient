@@ -31,6 +31,16 @@ type SqlCommand with
         }
 
 type SqlDataReader with
+    member internal this.MapRowValues<'TItem>( rowMapping) = 
+        seq {
+            use _ = this
+            let values = Array.zeroCreate this.FieldCount
+            while this.Read() do
+                this.GetValues(values) |> ignore
+                yield values |> rowMapping |> unbox<'TItem>
+        }
+
+type SqlDataReader with
     member internal this.TryGetValue(name: string) = 
         let value = this.[name] 
         if Convert.IsDBNull value then None else Some(unbox<'a> value)
@@ -93,7 +103,7 @@ and TypeInfo = {
     SqlEngineTypeId: int
     UserTypeId: int
     SqlDbTypeId: int
-    IsFixedLength: bool option
+    IsFixedLength: bool 
     ClrTypeFullName: string
     UdttName: string 
     TableTypeColumns: Column[] Lazy
@@ -107,12 +117,24 @@ type Parameter = {
     Name: string
     TypeInfo: TypeInfo
     Direction: ParameterDirection 
+    MaxLength: int
+    Precision: byte
+    Scale : byte
     DefaultValue: obj option
     Optional: bool
     Description: string
-}
+}   with
+    
+    member this.Size = 
+        match this.TypeInfo.SqlDbType with
+        | SqlDbType.NChar | SqlDbType.NText | SqlDbType.NVarChar -> this.MaxLength / 2
+        | _ -> this.MaxLength
 
-let internal dataTypeMappings = Dictionary<string, TypeInfo[]>()
+let private dataTypeMappings = Dictionary<string, TypeInfo[]>()
+
+let internal clearDataTypesMap() = dataTypeMappings.Clear()
+
+let internal getTypes( connectionString: string) = dataTypeMappings.[connectionString]
 
 let internal findTypeInfoBySqlEngineTypeId (connStr, system_type_id, user_type_id : int option) = 
     assert (dataTypeMappings.ContainsKey connStr)
@@ -252,7 +274,7 @@ type SqlConnection with
         ) 
         |> Seq.toArray
             
-    member internal this.GetParameters( routine: Routine, isSqlAzure) =      
+    member internal this.GetParameters( routine: Routine, isSqlAzure, useReturnValue) =      
         assert (this.State = ConnectionState.Open)
 
         let paramDefaults = Task.Factory.StartNew( fun() ->
@@ -289,43 +311,63 @@ type SqlConnection with
 	            ,user_type_id AS suggested_user_type_id
 	            ,is_output AS suggested_is_output
 	            ,CAST( IIF(is_output = 1, 0, 1) AS BIT) AS suggested_is_input
+                ,max_length
+                ,precision
+                ,scale
 	            ,description = ISNULL( XProp.Value, '')
-            FROM sys.all_parameters AS p
+            FROM sys.parameters AS p
                 OUTER APPLY %s AS XProp
             WHERE
                 p.Name <> '' 
                 AND OBJECT_ID('%s.%s') = object_id" descriptionSelector <|| routine.TwoPartName
 
+        [
+            use cmd = new SqlCommand( query, this)
+            use cursor = cmd.ExecuteReader()
+            while cursor.Read() do
+                let name = string cursor.["name"]
+                let direction = 
+                    if unbox cursor.["suggested_is_output"]
+                    then 
+                        ParameterDirection.Output
+                    else 
+                        assert(unbox cursor.["suggested_is_input"])
+                        ParameterDirection.Input 
 
-        use cmd = new SqlCommand( query, this)
-        cmd.ExecuteQuery(fun record -> 
-            let name = string record.["name"]
-            let direction = 
-                if unbox record.["suggested_is_output"]
-                then 
-                    invalidArg name "Output parameters are not supported"
-                else 
-                    assert(unbox record.["suggested_is_input"])
-                    ParameterDirection.Input 
+                let system_type_id: int = unbox<byte> cursor.["suggested_system_type_id"] |> int
+                let user_type_id = cursor.TryGetValue "suggested_user_type_id"
 
-            let system_type_id: int = unbox<byte> record.["suggested_system_type_id"] |> int
-            let user_type_id = record.TryGetValue "suggested_user_type_id"
+                let typeInfo = findTypeInfoBySqlEngineTypeId(this.ConnectionString, system_type_id, user_type_id)
+                let defaultValue = match paramDefaults.Result.TryGetValue(name) with | true, value -> value | false, _ -> None
+                let valueTypeWithNullDefault = typeInfo.IsValueType && defaultValue = Some(null)
 
-            let typeInfo = findTypeInfoBySqlEngineTypeId(this.ConnectionString, system_type_id, user_type_id)
-            let defaultValue = match paramDefaults.Result.TryGetValue(name) with | true, value -> value | false, _ -> None
-            let valueTypeWithNullDefault = typeInfo.IsValueType && defaultValue = Some(null)
+                yield { 
+                    Name = name
+                    TypeInfo = typeInfo
+                    Direction = direction
+                    MaxLength = cursor.["max_length"] |> unbox<int16> |> int
+                    Precision = unbox cursor.["precision"]
+                    Scale = unbox cursor.["scale"]
+                    DefaultValue = defaultValue
+                    Optional = valueTypeWithNullDefault 
+                    Description = string cursor.["description"]
+                }
 
-            { 
-                Name = name
-                TypeInfo = typeInfo
-                Direction = direction
-                DefaultValue = defaultValue
-                Optional = valueTypeWithNullDefault 
-                Description = string record.["description"]
-            }
-        )
-        |> Seq.toList
-
+            if routine.IsStoredProc && useReturnValue 
+            then
+                yield {
+                    Name = "@RETURN_VALUE"
+                    TypeInfo = findTypeInfoByProviderType(this.ConnectionString, SqlDbType.Int)
+                    Direction = ParameterDirection.ReturnValue
+                    MaxLength = 4
+                    Precision = 10uy
+                    Scale = 0uy
+                    DefaultValue = None
+                    Optional = false 
+                    Description = ""
+                } 
+        ]
+        
     member internal this.GetTables( schema, isSqlAzure) = 
         assert (this.State = ConnectionState.Open)
         let descriptionSelector = 
@@ -412,8 +454,8 @@ type SqlConnection with
 
                         let isFixedLength = 
                             if row.IsNull("IsFixedLength") 
-                            then None 
-                            else row.["IsFixedLength"] |> unbox |> Some
+                            then false 
+                            else row.["IsFixedLength"] |> unbox 
 
                         let providedType = unbox row.["ProviderDbType"]
                         if providedType <> int SqlDbType.Structured
@@ -457,7 +499,7 @@ type SqlConnection with
                                 |> Array.pick (fun (typename', _, system_type_id', _, _, _, is_user_defined') -> if system_type_id = system_type_id' && not is_user_defined' then Some typename' else None)
                             providerTypes.[system_type_name]
                         | false, _ when is_table_type -> 
-                            int SqlDbType.Structured, "", None
+                            int SqlDbType.Structured, "", false
                         | _ -> failwith ("Unexpected type: " + full_name)
 
                     let clrTypeFixed = if system_type_id = 48 (*tinyint*) then typeof<byte>.FullName else clrType
@@ -509,5 +551,3 @@ type SqlConnection with
 
             dataTypeMappings.Add( this.ConnectionString, typeInfos)
 
-    member this.ClearDataTypesMap() = 
-        dataTypeMappings.Clear()

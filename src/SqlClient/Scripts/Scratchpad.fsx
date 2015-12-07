@@ -9,28 +9,19 @@ open System.Data.SqlTypes
 
 [<Literal>]
 let connStr = "Data Source=.;Initial Catalog=AdventureWorks2014;Integrated Security=True"
-do 
-    use conn = new SqlConnection(connStr)
-    conn.Open()
-    use tran = conn.BeginTransaction()
-    let cmd = new SqlCommand()
-    cmd.Connection <- conn
-    cmd.Transaction <- tran
-    cmd.CommandText <- 
-        //"INSERT INTO [HumanResources].[Shift] ([Name], [StartTime], [EndTime]) VALUES (@p1, @p2, @p3)"
-        "INSERT INTO [HumanResources].[Shift] ([Name], [StartTime], [EndTime], [ModifiedDate]) VALUES (@p1, @p2, @p3, @p4)"
-    cmd.Parameters.AddWithValue("@p1", "French coffee break") |> ignore
-    cmd.Parameters.AddWithValue("@p2", TimeSpan.FromHours 10.) |> ignore
-    cmd.Parameters.AddWithValue("@p3", TimeSpan.FromHours 12.) |> ignore
-    cmd.Parameters.AddRange [|
-        SqlParameter("@p4", SqlDbType.DateTime2, IsNullable = true, Value = DBNull.Value)
-    |]
-    //cmd.Parameters.AddWithValue("@p4", DBNull.Value)
-    cmd.ExecuteNonQuery() |> printfn "Records affected: %i"
+let conn = new SqlConnection(connStr)
+conn.Open()
+let cmd = new SqlCommand("dbo.AddRef", conn, CommandType = CommandType.StoredProcedure)
 
+SqlCommandBuilder.DeriveParameters(cmd)
+for p in cmd.Parameters do
+    printfn "Name: %s, type: %A, direction: %A" p.ParameterName p.SqlDbType p.Direction
 
-let table = new DataTable()
-let col = new DataColumn("ModifiedDate", typeof<DateTime>)
-col.DefaultValue.GetType().FullName
-col.AllowDBNull
-table.Columns.Add col
+cmd.Parameters.["@x"].Value <- 12
+cmd.Parameters.["@y"].Value  <- 3
+cmd.Parameters.["@sum"].Value <- DBNull.Value
+cmd.ExecuteNonQuery() 
+
+cmd.Parameters.["@sum"].Value
+cmd.Parameters.["@RETURN_VALUE"].Value
+

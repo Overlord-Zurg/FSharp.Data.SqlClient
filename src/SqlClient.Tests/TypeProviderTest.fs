@@ -13,6 +13,11 @@ let asyncSinlgeColumn() =
     Assert.Equal<int[]>([| 2; 4; 8; 24 |], cmd.AsyncExecute() |> Async.RunSynchronously |> Seq.toArray)    
 
 [<Fact>]
+let emptyResultset() = 
+    use cmd = new SqlCommandProvider<"SELECT 42 WHERE 0 > 1", ConnectionStrings.AdventureWorksNamed>()
+    Assert.Equal<_ []>( Array.empty, cmd.Execute() |> Seq.toArray)    
+
+[<Fact>]
 let ConnectionClose() = 
     use cmd = new GetEvenNumbers()
     let untypedCmd : ISqlCommand = upcast cmd
@@ -101,7 +106,7 @@ let ``ToTraceString for CRUD``() =
     )
     
     Assert.Equal<string>(
-        expected = "exec sp_executesql N'INSERT INTO Sales.Currency VALUES(@Code, @Name, GETDATE())',N'@Code NChar(3),@Name NVarChar(7)',@Code='BTC',@Name='Bitcoin'",
+        expected = "exec sp_executesql N'INSERT INTO Sales.Currency VALUES(@Code, @Name, GETDATE())',N'@Code NChar(3),@Name NVarChar(50)',@Code='BTC',@Name='Bitcoin'",
         actual = let cmd = new InsertBitCoin() in cmd.ToTraceString( bitCoinCode, bitCoinName)
     )
 
@@ -121,7 +126,7 @@ let ``ToTraceString double-quotes``() =
     )>]
 let CommandTimeout() =
     use cmd = 
-        new SqlCommandProvider<"WAITFOR DELAY '00:00:35'; SELECT 42", ConnectionStrings.AdventureWorksNamed, SingleRow = true>(commandTimeout = 60)
+        new SqlCommandProvider<"WAITFOR DELAY '00:00:06'; SELECT 42", ConnectionStrings.AdventureWorksNamed, SingleRow = true>(commandTimeout = 60)
     Assert.Equal(60, cmd.CommandTimeout)
     Assert.Equal(Some 42, cmd.Execute())     
 
@@ -172,6 +177,41 @@ let ``Setting the command timeout isn't overridden when giving ConnectionStrings
     Assert.Equal(customTimeout, getDate.CommandTimeout)
     let sqlCommand = (getDate :> ISqlCommand).Raw
     Assert.Equal(customTimeout, sqlCommand.CommandTimeout)
+
+[<Fact(Skip = "Thread safe execution is not supported yet")>]
+let ConcurrentReaders() =
+    let cmd = new GetEvenNumbers(ConnectionStrings.AdventureWorksLiteralMultipleActiveResults)
+    let expected  = [| 2, 2; 4,4; 8,8; 24, 24 |]
+    let actual = (cmd.Execute(), cmd.Execute()) ||> Seq.zip |> Seq.toArray
+    Assert.Equal<_[]>(expected, actual)
+
+[<Fact>]
+let ResultsetExtendedWithTrailingColumn() =
+    let cmd = new SqlCommandProvider<"
+        WITH XS AS
+        (
+	        SELECT 
+                Value
+                ,GETDATE() AS Now
+	        FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) as T(Value)
+        )
+        SELECT * FROM XS
+    ", ConnectionStrings.AdventureWorksNamed>()
+
+    Assert.Equal<_ list>([0..9], [ for x in cmd.Execute() -> x.Value ])
+    
+    (cmd :> ISqlCommand).Raw.CommandText <-"
+        WITH XS AS
+        (
+	        SELECT 
+                Value
+                ,GETDATE() AS Now
+	            ,SUM(Value) OVER (ORDER BY Value) AS Total
+	        FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) as T(Value)
+        )
+        SELECT * FROM XS
+    "
+    Assert.Equal<_ list>([0..9], [ for x in cmd.Execute() -> x.Value ])
 
 module ``The undeclared parameter 'X' is used more than once in the batch being analyzed`` = 
     [<Fact>]

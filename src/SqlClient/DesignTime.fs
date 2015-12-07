@@ -4,6 +4,7 @@ open System
 open System.Reflection
 open System.Data
 open System.Data.SqlClient
+open System.Collections.Generic
 open System.Diagnostics
 open Microsoft.FSharp.Quotations
 //open Microsoft.FSharp.Reflection
@@ -28,21 +29,27 @@ type internal ResultTypes = {
 
 type DesignTime private() = 
     static member internal AddGeneratedMethod
-        (sqlParameters: Parameter list, executeArgs: ProvidedParameter list, erasedType, providedOutputType, name) =
+        (sqlParameters: Parameter list, hasOutputParameters, executeArgs: ProvidedParameter list, erasedType, providedOutputType, name) =
 
-        let mappedParamValues (exprArgs: Expr list) = 
+        let mappedInputParamValues (exprArgs: Expr list) = 
             (exprArgs.Tail, sqlParameters)
             ||> List.map2 (fun expr param ->
                 let value = 
-                    if param.Optional && not param.TypeInfo.TableType
+                    if param.Direction = ParameterDirection.Input
                     then 
-                        typeof<QuotationsFactory>
-                            .GetMethod("OptionToObj", BindingFlags.NonPublic ||| BindingFlags.Static)
-                            .MakeGenericMethod(param.TypeInfo.ClrType)
-                            .Invoke(null, [| box expr|])
-                            |> unbox
+                        if param.Optional && not param.TypeInfo.TableType 
+                        then 
+                            typeof<QuotationsFactory>
+                                .GetMethod("OptionToObj", BindingFlags.NonPublic ||| BindingFlags.Static)
+                                .MakeGenericMethod(param.TypeInfo.ClrType)
+                                .Invoke(null, [| box expr|])
+                                |> unbox
+                        else
+                            expr
                     else
-                        expr
+                        let t = param.TypeInfo.ClrType
+                        Expr.Value(Activator.CreateInstance(t), t)
+
                 <@@ (%%Expr.Value(param.Name) : string), %%Expr.Coerce(value, typeof<obj>) @@>
             )
 
@@ -50,9 +57,41 @@ type DesignTime private() =
         
         m.InvokeCode <- fun exprArgs ->
             let methodInfo = typeof<ISqlCommand>.GetMethod(name)
-            let vals = mappedParamValues(exprArgs)
-            let paramValues = Expr.NewArray(typeof<string*obj>, elements = vals)
-            Expr.Call( Expr.Coerce(exprArgs.[0], erasedType), methodInfo, [paramValues])
+            let vals = mappedInputParamValues(exprArgs)
+            let paramValues = Expr.NewArray( typeof<string * obj>, elements = vals)
+            if not hasOutputParameters
+            then 
+                Expr.Call( Expr.Coerce( exprArgs.[0], erasedType), methodInfo, [ paramValues ])    
+            else
+                let mapOutParamValues = 
+                    let arr = Var("parameters", typeof<(string * obj)[]>)
+                    let body = 
+                        (sqlParameters, exprArgs.Tail)
+                        ||> List.zip
+                        |> List.mapi (fun index (sqlParam, argExpr) ->
+                            if sqlParam.Direction.HasFlag( ParameterDirection.Output)
+                            then 
+                                let mi = 
+                                    typeof<DesignTime>
+                                        .GetMethod("SetRef")
+                                        .MakeGenericMethod( sqlParam.TypeInfo.ClrType)
+                                Expr.Call(mi, [ argExpr; Expr.Var arr; Expr.Value index ]) |> Some
+                            else 
+                                None
+                        ) 
+                        |> List.choose id
+                        |> List.fold (fun acc x -> Expr.Sequential(acc, x)) <@@ () @@>
+
+                    Expr.Lambda(arr, body)
+
+                let xs = Var("parameters", typeof<(string * obj)[]>)
+                let execute = Expr.Lambda(xs , Expr.Call( Expr.Coerce( exprArgs.[0], erasedType), methodInfo, [ Expr.Var xs ]))
+                <@@
+                    let ps: (string * obj)[] = %%paramValues
+                    let result = (%%execute) ps
+                    ps |> %%mapOutParamValues
+                    result
+                @@>
 
         let xmlDoc = 
             sqlParameters
@@ -68,6 +107,9 @@ type DesignTime private() =
         if not(String.IsNullOrWhiteSpace xmlDoc) then m.AddXmlDoc xmlDoc
 
         m
+
+    static member SetRef<'t>(r : byref<'t>, arr: (string * obj)[], i) = 
+        r <- arr.[i] |> snd |> unbox
 
     static member internal GetRecordType(columns: Column list) =
         
@@ -169,7 +211,14 @@ type DesignTime private() =
                     let names = Expr.NewArray(typeof<string>, outputColumns |> List.map (fun x -> Expr.Value(x.Name))) 
                     Some r,
                     typeof<obj>,
-                    <@@ fun values -> let data = (%%names, values) ||> Array.zip |> dict in DynamicRecord( data) |> box @@>
+                    <@@ 
+                        fun (values: obj[]) -> 
+                            let data = Dictionary()
+                            let names: string[] = %%names
+                            for i = 0 to names.Length - 1 do 
+                                data.Add(names.[i], values.[i])
+                            DynamicRecord( data) |> box 
+                    @@>
                 else 
                     let tupleType = 
                         match outputColumns with
@@ -177,8 +226,8 @@ type DesignTime private() =
                         | xs -> Microsoft.FSharp.Reflection.FSharpType.MakeTupleType [| for x in xs -> x.ClrTypeConsideringNullable|]
 
                     let tupleTypeName = tupleType.PartialAssemblyQualifiedName
-                    //None, tupleType, <@@ FSharpValue.PreComputeTupleConstructor (Type.GetType (tupleTypeName))  @@>
-                    None, tupleType, <@@ fun values -> Type.GetType(tupleTypeName, throwOnError = true).GetConstructors().[0].Invoke(values) @@>
+                    None, tupleType, <@@ Microsoft.FSharp.Reflection.FSharpValue.PreComputeTupleConstructor (Type.GetType (tupleTypeName))  @@>
+                    //None, tupleType, <@@ fun values -> Type.GetType(tupleTypeName, throwOnError = true).GetConstructors().[0].Invoke(values) @@>
             
             let nullsToOptions = QuotationsFactory.MapArrayNullableItems(outputColumns, "MapArrayObjItemToOption") 
             let combineWithNullsToOptions = typeof<QuotationsFactory>.GetMethod("GetMapperWithNullsToOptions") 
@@ -220,7 +269,10 @@ type DesignTime private() =
             unbox<int> cursor.["suggested_system_type_id"], 
             cursor.TryGetValue "suggested_user_type_id",
             unbox cursor.["suggested_is_output"],
-            unbox cursor.["suggested_is_input"]
+            unbox cursor.["suggested_is_input"],
+            cursor.["suggested_max_length"] |> unbox<int16> |> int,
+            unbox cursor.["suggested_precision"] |> unbox<byte>,
+            unbox cursor.["suggested_scale"] |> unbox<byte>
         )        
 
     static member internal ExtractParameters(connection, commandText: string, allParametersOptional) =  
@@ -240,13 +292,13 @@ type DesignTime private() =
                     reraise()
 
         parameters
-        |> Seq.map(fun (name, sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input) ->
+        |> Seq.map(fun (name, sqlEngineTypeId, userTypeId, is_output, is_input, max_length, precision, scale) ->
             let direction = 
-                if suggested_is_output
+                if is_output
                 then 
                     invalidArg name "Output parameters are not supported"
                 else 
-                    assert(suggested_is_input)
+                    assert(is_input)
                     ParameterDirection.Input 
                     
             let typeInfo = findTypeInfoBySqlEngineTypeId(connection.ConnectionString, sqlEngineTypeId, userTypeId)
@@ -255,6 +307,9 @@ type DesignTime private() =
                 Name = name
                 TypeInfo = typeInfo 
                 Direction = direction 
+                MaxLength = max_length 
+                Precision = precision 
+                Scale = scale 
                 DefaultValue = None
                 Optional = allParametersOptional 
                 Description = null 
@@ -317,12 +372,12 @@ type DesignTime private() =
             let mapBack = unboundVars |> Seq.collect(fun (KeyValue(name, xs)) -> [ for newName, _, _ in xs -> newName, name ]) |> dict
             let tryUnify = 
                 altered
-                |> Seq.map (fun (name, sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input) -> 
+                |> Seq.map (fun (name, sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input, max_length, precision, scale) -> 
                     let oldName = 
                         match mapBack.TryGetValue name with 
                         | true, original -> original 
                         | false, _ -> name
-                    oldName, (sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input)
+                    oldName, (sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input, max_length, precision, scale)
                 )
                 |> Seq.groupBy fst
                 |> Seq.map( fun (name, xs) -> name, xs |> Seq.map snd |> Seq.distinct |> Seq.toArray)
@@ -334,14 +389,14 @@ type DesignTime private() =
             else
                 tryUnify 
                 |> Array.map (fun (name, xs) -> 
-                    let sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input = xs.[0] //|> Seq.exactlyOne
-                    name, sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input
+                    let sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input, max_length, precision, scale = xs.[0] //|> Seq.exactlyOne
+                    name, sqlEngineTypeId, userTypeId, suggested_is_output, suggested_is_input, max_length, precision, scale
                 )
                 |> Some
         else
             None
                 
-    static member internal GetExecuteArgs(cmdProvidedType: ProvidedTypeDefinition, sqlParameters: Parameter list, udttsPerSchema: System.Collections.Generic.Dictionary<_, ProvidedTypeDefinition>) = 
+    static member internal GetExecuteArgs(cmdProvidedType: ProvidedTypeDefinition, sqlParameters: Parameter list, udttsPerSchema: Dictionary<_, ProvidedTypeDefinition>) = 
         [
             for p in sqlParameters do
                 assert p.Name.StartsWith("@")
@@ -352,33 +407,42 @@ type DesignTime private() =
                     then
                         if p.Optional 
                         then 
+                            assert(p.Direction = ParameterDirection.Input)
                             ProvidedParameter(parameterName, parameterType = typedefof<_ option>.MakeGenericType( p.TypeInfo.ClrType) , optionalValue = null)
                         else
-                            ProvidedParameter(parameterName, parameterType = p.TypeInfo.ClrType, ?optionalValue = p.DefaultValue)
+                            if p.Direction.HasFlag(ParameterDirection.Output)
+                            then
+                                ProvidedParameter(parameterName, parameterType = p.TypeInfo.ClrType.MakeByRefType(), isOut = true)
+                            else                                 
+                                ProvidedParameter(parameterName, parameterType = p.TypeInfo.ClrType, ?optionalValue = p.DefaultValue)
                     else
                         assert(p.Direction = ParameterDirection.Input)
 
                         let userDefinedTableTypeRow = 
                             if udttsPerSchema = null
                             then //SqlCommandProvider case
-                                let rowType = ProvidedTypeDefinition(p.TypeInfo.UdttName, Some typeof<obj>, HideObjectMethods = true)
-                                cmdProvidedType.AddMember rowType
-                                let parameters = [ 
-                                    for p in p.TypeInfo.TableTypeColumns.Value -> 
-                                        ProvidedParameter( p.Name, p.ClrTypeConsideringNullable, ?optionalValue = if p.Nullable then Some null else None) 
-                                ] 
+                                match cmdProvidedType.GetNestedType(p.TypeInfo.UdttName) with 
+                                | null -> 
+                                    let rowType = ProvidedTypeDefinition(p.TypeInfo.UdttName, Some typeof<obj>, HideObjectMethods = true)
+                                    cmdProvidedType.AddMember rowType
 
-                                let ctor = ProvidedConstructor( parameters)
-                                ctor.InvokeCode <- fun args -> 
-                                    let optionsToNulls = QuotationsFactory.MapArrayNullableItems(List.ofArray p.TypeInfo.TableTypeColumns.Value, "MapArrayOptionItemToObj") 
-                                    <@@
-                                        let values: obj[] = %%Expr.NewArray(typeof<obj>, [ for a in args -> Expr.Coerce(a, typeof<obj>) ])
-                                        (%%optionsToNulls) values
-                                        values
-                                    @@>
-                                rowType.AddMember ctor
+                                    let parameters = [ 
+                                        for p in p.TypeInfo.TableTypeColumns.Value -> 
+                                            ProvidedParameter( p.Name, p.ClrTypeConsideringNullable, ?optionalValue = if p.Nullable then Some null else None) 
+                                    ] 
+
+                                    let ctor = ProvidedConstructor( parameters)
+                                    ctor.InvokeCode <- fun args -> 
+                                        let optionsToNulls = QuotationsFactory.MapArrayNullableItems(List.ofArray p.TypeInfo.TableTypeColumns.Value, "MapArrayOptionItemToObj") 
+                                        <@@
+                                            let values: obj[] = %%Expr.NewArray(typeof<obj>, [ for a in args -> Expr.Coerce(a, typeof<obj>) ])
+                                            (%%optionsToNulls) values
+                                            values
+                                        @@>
+                                    rowType.AddMember ctor
                             
-                                rowType
+                                    rowType
+                                | x -> downcast x //same type appears more than once
                             else //SqlProgrammability
                                 let udtt = udttsPerSchema.[p.TypeInfo.Schema].GetNestedType(p.TypeInfo.UdttName)
                                 downcast udtt
