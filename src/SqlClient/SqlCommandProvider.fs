@@ -58,10 +58,11 @@ type public SqlCommandProvider(config : TypeProviderConfig) as this =
                 ProvidedStaticParameter("ConfigFile", typeof<string>, "") 
                 ProvidedStaticParameter("AllParametersOptional", typeof<bool>, false) 
                 ProvidedStaticParameter("ResolutionFolder", typeof<string>, "") 
-                ProvidedStaticParameter("DataDirectory", typeof<string>, "") 
+                ProvidedStaticParameter("DataDirectory", typeof<string>, "")
+                ProvidedStaticParameter("UseReturnValue", typeof<bool>, false)
             ],             
             instantiationFunction = (fun typeName args ->
-                let value = lazy this.CreateRootType(typeName, unbox args.[0], unbox args.[1], unbox args.[2], unbox args.[3], unbox args.[4], unbox args.[5], unbox args.[6], unbox args.[7])
+                let value = lazy this.CreateRootType(typeName, unbox args.[0], unbox args.[1], unbox args.[2], unbox args.[3], unbox args.[4], unbox args.[5], unbox args.[6], unbox args.[7], unbox args.[8])
                 cache.GetOrAdd(typeName, value)
             ) 
         )
@@ -76,6 +77,7 @@ type public SqlCommandProvider(config : TypeProviderConfig) as this =
 <param name='AllParametersOptional'>If set all parameters become optional. NULL input values must be handled inside T-SQL.</param>
 <param name='ResolutionFolder'>A folder to be used to resolve relative file paths to *.sql script files at compile time. The default value is the folder that contains the project or script.</param>
 <param name='DataDirectory'>The name of the data directory that replaces |DataDirectory| in connection strings. The default value is the project or script directory.</param>
+<param name='UseReturnValue'>If true, the stored procedure's integer return value will also be returned as a byref int. Not compatible with ResultType.SqlDataReader. The default value is the project or script directory.</param>
 """
 
         this.AddNamespace(nameSpace, [ providerType ])
@@ -87,7 +89,10 @@ type public SqlCommandProvider(config : TypeProviderConfig) as this =
         |> defaultArg 
         <| base.ResolveAssembly args
 
-    member internal this.CreateRootType(typeName, sqlStatementOrFile, connectionStringOrName: string, resultType, singleRow, configFile, allParametersOptional, resolutionFolder, dataDirectory) = 
+    member internal this.CreateRootType(typeName, sqlStatementOrFile, connectionStringOrName: string, resultType, singleRow, configFile, allParametersOptional, resolutionFolder, dataDirectory, useReturnValue) = 
+            
+        if useReturnValue && resultType = ResultType.DataReader then invalidArg "useReturnValue" "useReturnValue is not compatible with DataReader"
+        //if useReturnValue then invalidArg "useReturnValue" "useReturnValue is nyi"
 
         if singleRow && not (resultType = ResultType.Records || resultType = ResultType.Tuples)
         then 
@@ -126,35 +131,39 @@ type public SqlCommandProvider(config : TypeProviderConfig) as this =
         conn.CheckVersion()
         conn.LoadDataTypesMap()
 
-        let parameters = DesignTime.ExtractParameters(conn, sqlStatement, allParametersOptional)
+        let parameters = DesignTime.ExtractParameters(conn, sqlStatement, allParametersOptional, useReturnValue)
 
         let outputColumns = 
             if resultType <> ResultType.DataReader
-            then DesignTime.GetOutputColumns(conn, sqlStatement, parameters, isStoredProcedure = false)
-            else []
-
-        let rank = if singleRow then ResultRank.SingleRow else ResultRank.Sequence
-        let output = DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters = false)
+            then try DesignTime.GetOutputColumns(conn, sqlStatement, parameters, isStoredProcedure = false) |> Choice1Of2
+                 with e -> Choice2Of2 e
+            else [] |> Choice1Of2   
         
+        let rank = if singleRow then ResultRank.SingleRow else ResultRank.Sequence
+        
+        let output =
+            match outputColumns with
+            | Choice2Of2 _ -> // exception occurred while trying to determine output type,, fall back to DataReader
+                //do failwithf "nyi when the output columns cannot be derived. %A" e
+                DesignTime.GetOutputTypes([], ResultType.DataReader, rank, false)
+            | Choice1Of2 outputColumns ->
+                DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters = false)
+
         let cmdProvidedType = ProvidedTypeDefinition(assembly, nameSpace, typeName, Some typeof<``ISqlCommand Implementation``>, HideObjectMethods = true)
 
         do  
-            cmdProvidedType.AddMember(ProvidedProperty("ConnectionStringOrName", typeof<string>, [], IsStatic = true, GetterCode = fun _ -> <@@ connectionStringOrName @@>))
-
-        do
-            if resultType = ResultType.Records then
-                // Add .Record
-                output.ProvidedRowType |> Option.iter cmdProvidedType.AddMember
-            elif resultType = ResultType.DataTable then
-                // add .Table
-                output.ProvidedType |>  cmdProvidedType.AddMember
+            cmdProvidedType.AddMember(ProvidedProperty("ConnectionStringOrName", typeof<string>, [], IsStatic = true, GetterCode = fun _ -> <@@ connectionStringOrName @@>))    
+            
 
         do  //ctors
             let designTimeConfig = 
                 let expectedDataReaderColumns = 
                     Expr.NewArray(
                         typeof<string * string>, 
-                        [ for c in outputColumns -> Expr.NewTuple [ Expr.Value c.Name; Expr.Value c.TypeInfo.ClrTypeFullName ] ]
+                        match outputColumns with
+                        | Choice1Of2 outputColumns ->
+                            [ for c in outputColumns -> Expr.NewTuple [ Expr.Value c.Name; Expr.Value c.TypeInfo.ClrTypeFullName ] ]
+                        | Choice2Of2 _ -> []
                     )
 
                 <@@ {
@@ -177,6 +186,16 @@ type public SqlCommandProvider(config : TypeProviderConfig) as this =
                     factoryMethodName = "Create"
                 )
                 |> cmdProvidedType.AddMembers
+
+        do
+            if resultType = ResultType.Records then
+                // Add .Record
+                output.ProvidedRowType |> Option.iter cmdProvidedType.AddMember
+            elif resultType = ResultType.DataTable then
+                // add .Table
+                output.ProvidedType |>  cmdProvidedType.AddMember
+
+
 
         do  //AsyncExecute, Execute, and ToTraceString
 

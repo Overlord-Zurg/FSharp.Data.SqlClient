@@ -56,6 +56,7 @@ type public SqlProgrammabilityProvider(config : TypeProviderConfig) as this =
 <param name='ResultType'>A value that defines structure of result: Records, Tuples, DataTable, or SqlDataReader.</param>
 <param name='ConfigFile'>The name of the configuration file that’s used for connection strings at DESIGN-TIME. The default value is app.config or web.config.</param>
 <param name='DataDirectory'>The name of the data directory that replaces |DataDirectory| in connection strings. The default value is the project or script directory.</param>
+<param name='UseReturnValue'>If true, the stored procedure's integer return value will also be returned as a byref int. The default value is the project or script directory.</param>
 """
 
         this.AddNamespace(nameSpace, [ providerType ])
@@ -162,75 +163,83 @@ type public SqlProgrammabilityProvider(config : TypeProviderConfig) as this =
                 
                 cmdProvidedType.AddMembersDelayed <| fun() ->
                     [
+                        //System.Diagnostics.Debug.Assert(false, "I am a bad peson", "I am a detailed bad person", "Badness", "Personality")
                         use __ = conn.UseLocally()
                         let parameters = conn.GetParameters( routine, isSqlAzure, useReturnValue)
 
                         let commandText = routine.ToCommantText(parameters)
-                        let outputColumns = DesignTime.GetOutputColumns(conn, commandText, parameters, routine.IsStoredProc)
+                        let outputColumns = try DesignTime.GetOutputColumns(conn, commandText, parameters, routine.IsStoredProc) |> Choice1Of2
+                                            with e -> Choice2Of2 e
                         let rank = if routine.Type = ScalarValuedFunction then ResultRank.ScalarValue else ResultRank.Sequence
 
                         let hasOutputParameters = parameters |> List.exists (fun x -> x.Direction.HasFlag( ParameterDirection.Output))
+                        
+                        match outputColumns with
+                        | Choice2Of2 e ->
 
-                        let output = DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters)
+                            failwithf "Nyi for columns that throw exception on GetOutputColumns. Exception: %A" e
+                        | Choice1Of2 outputColumns -> 
+
+                            let output = DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters)
         
-                        do  //Record
-                            output.ProvidedRowType |> Option.iter cmdProvidedType.AddMember
+                            do  //Record
+                                output.ProvidedRowType |> Option.iter cmdProvidedType.AddMember
 
-                        //ctors
-                        let sqlParameters = Expr.NewArray( typeof<SqlParameter>, parameters |> List.map QuotationsFactory.ToSqlParam)
+                            //ctors
+                            let sqlParameters = Expr.NewArray( typeof<SqlParameter>, parameters |> List.map QuotationsFactory.ToSqlParam)
 
-                        let designTimeConfig = 
-                            let expectedDataReaderColumns = 
-                                Expr.NewArray(
-                                    typeof<string * string>, 
-                                    [ for c in outputColumns -> Expr.NewTuple [ Expr.Value c.Name; Expr.Value c.TypeInfo.ClrTypeFullName ] ]
-                                )
+                            let designTimeConfig = 
+                                let expectedDataReaderColumns = 
+                                    Expr.NewArray(
+                                        typeof<string * string>, 
+                                        [ for c in outputColumns -> Expr.NewTuple [ Expr.Value c.Name; Expr.Value c.TypeInfo.ClrTypeFullName ] ]
+                                    )
 
-                            <@@ {
-                                SqlStatement = commandText
-                                IsStoredProcedure = %%Expr.Value( routine.IsStoredProc)
-                                Parameters = %%sqlParameters
-                                ResultType = resultType
-                                Rank = rank
-                                RowMapping = %%output.RowMapping
-                                ItemTypeName = %%Expr.Value( output.ErasedToRowType.PartialAssemblyQualifiedName)
-                                ExpectedDataReaderColumns = %%expectedDataReaderColumns
-                            } @@>
+                                <@@ {
+                                    SqlStatement = commandText
+                                    IsStoredProcedure = %%Expr.Value( routine.IsStoredProc)
+                                    Parameters = %%sqlParameters
+                                    ResultType = resultType
+                                    Rank = rank
+                                    RowMapping = %%output.RowMapping
+                                    ItemTypeName = %%Expr.Value( output.ErasedToRowType.PartialAssemblyQualifiedName)
+                                    ExpectedDataReaderColumns = %%expectedDataReaderColumns
+                                } @@>
 
-                        yield! DesignTime.GetCommandCtors(
-                            cmdProvidedType, 
-                            designTimeConfig, 
-                            designTimeConnectionString,
-                            config.IsHostedExecution
-                        )
+                            yield! DesignTime.GetCommandCtors(
+                                cmdProvidedType, 
+                                designTimeConfig, 
+                                designTimeConnectionString,
+                                config.IsHostedExecution
+                            )
 
-                        let executeArgs = DesignTime.GetExecuteArgs(cmdProvidedType, parameters, uddtsPerSchema)
+                            let executeArgs = DesignTime.GetExecuteArgs(cmdProvidedType, parameters, uddtsPerSchema)
 
-                        yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, output.ProvidedType, "Execute") 
-
-                        if not hasOutputParameters
-                        then                              
-                            let asyncReturnType = ProvidedTypeBuilder.MakeGenericType(typedefof<_ Async>, [ output.ProvidedType ])
-                            yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, asyncReturnType, "AsyncExecute")
-
-                        if output.ErasedToRowType <> typeof<Void>
-                        then 
-                            let providedReturnType = 
-                                ProvidedTypeBuilder.MakeGenericType(
-                                    typedefof<_ option>, 
-                                    [ (match output.ProvidedRowType with None -> output.ErasedToRowType | Some x -> upcast x)  ]
-                                ) 
-
-                            let providedAsyncReturnType = 
-                                ProvidedTypeBuilder.MakeGenericType(
-                                    typedefof<_ Async>, 
-                                    [ providedReturnType ]
-                                ) 
+                            yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, output.ProvidedType, "Execute") 
 
                             if not hasOutputParameters
                             then                              
-                                yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, providedReturnType, "ExecuteSingle") 
-                                yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, providedAsyncReturnType, "AsyncExecuteSingle")
+                                let asyncReturnType = ProvidedTypeBuilder.MakeGenericType(typedefof<_ Async>, [ output.ProvidedType ])
+                                yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, asyncReturnType, "AsyncExecute")
+
+                            if output.ErasedToRowType <> typeof<Void>
+                            then 
+                                let providedReturnType = 
+                                    ProvidedTypeBuilder.MakeGenericType(
+                                        typedefof<_ option>, 
+                                        [ (match output.ProvidedRowType with None -> output.ErasedToRowType | Some x -> upcast x)  ]
+                                    ) 
+
+                                let providedAsyncReturnType = 
+                                    ProvidedTypeBuilder.MakeGenericType(
+                                        typedefof<_ Async>, 
+                                        [ providedReturnType ]
+                                    ) 
+
+                                if not hasOutputParameters
+                                then                              
+                                    yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, providedReturnType, "ExecuteSingle") 
+                                    yield upcast DesignTime.AddGeneratedMethod(parameters, hasOutputParameters, executeArgs, cmdProvidedType.BaseType, providedAsyncReturnType, "AsyncExecuteSingle")
                     ]
 
                 yield cmdProvidedType
@@ -515,7 +524,7 @@ type public SqlProgrammabilityProvider(config : TypeProviderConfig) as this =
                         invalidArg "singleRow" "singleRow can be set only for ResultType.Records or ResultType.Tuples."
 
                     use __ = conn.UseLocally()
-                    let parameters = DesignTime.ExtractParameters(conn, sqlStatement, allParametersOptional)
+                    let parameters = DesignTime.ExtractParameters(conn, sqlStatement, allParametersOptional, false)
 
                     let outputColumns = 
                         if resultType <> ResultType.DataReader

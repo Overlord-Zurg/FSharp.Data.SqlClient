@@ -318,7 +318,7 @@ type DesignTime private() =
             unbox cursor.["suggested_scale"] |> unbox<byte>
         )        
 
-    static member internal ExtractParameters(connection, commandText: string, allParametersOptional) =  
+    static member internal ExtractParameters(connection, commandText: string, allParametersOptional, useReturnValue) =  
         
         use cmd = new SqlCommand("sys.sp_describe_undeclared_parameters", connection, CommandType = CommandType.StoredProcedure)
         cmd.Parameters.AddWithValue("@tsql", commandText) |> ignore
@@ -334,31 +334,49 @@ type DesignTime private() =
                 | _ -> 
                     reraise()
 
-        parameters
-        |> Seq.map(fun (name, sqlEngineTypeId, userTypeId, is_output, is_input, max_length, precision, scale) ->
-            let direction = 
-                if is_output
-                then 
-                    invalidArg name "Output parameters are not supported"
-                else 
-                    assert(is_input)
-                    ParameterDirection.Input 
+        let retParameters =
+            parameters
+            |> Seq.map(fun (name, sqlEngineTypeId, userTypeId, is_output, is_input, max_length, precision, scale) ->
+                let direction = 
+                    if is_output
+                    then 
+                        invalidArg name "Output parameters are not supported"
+                    else 
+                        assert(is_input)
+                        ParameterDirection.Input 
                     
-            let typeInfo = findTypeInfoBySqlEngineTypeId(connection.ConnectionString, sqlEngineTypeId, userTypeId)
+                let typeInfo = findTypeInfoBySqlEngineTypeId(connection.ConnectionString, sqlEngineTypeId, userTypeId)
 
-            { 
-                Name = name
-                TypeInfo = typeInfo 
-                Direction = direction 
-                MaxLength = max_length 
-                Precision = precision 
-                Scale = scale 
+                { 
+                    Name = name
+                    TypeInfo = typeInfo 
+                    Direction = direction 
+                    MaxLength = max_length 
+                    Precision = precision 
+                    Scale = scale 
+                    DefaultValue = None
+                    Optional = allParametersOptional 
+                    Description = null 
+                }
+            )
+            |> Seq.toList
+
+        if useReturnValue = false
+        then retParameters
+        else
+            {
+                Name = "@RETURN_VALUE"
+                TypeInfo = findTypeInfoByProviderType(connection.ConnectionString, SqlDbType.Int)
+                Direction = ParameterDirection.ReturnValue
+                MaxLength = 4
+                Precision = 10uy
+                Scale = 0uy
                 DefaultValue = None
-                Optional = allParametersOptional 
-                Description = null 
-            }
-        )
-        |> Seq.toList
+                Optional = false 
+                Description = ""
+            } :: retParameters
+            
+        
 
     static member internal RewriteSqlStatementToEnableMoreThanOneParameterDeclaration(cmd: SqlCommand, why: SqlException) =  
         

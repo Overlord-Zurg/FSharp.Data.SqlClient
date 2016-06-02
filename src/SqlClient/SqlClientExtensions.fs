@@ -284,7 +284,7 @@ type SqlConnection with
 
     member internal this.GetUserSchemas() = 
         use __ = this.UseLocally()
-        use cmd = new SqlCommand("SELECT name FROM sys.schemas WHERE principal_id = 1", this)
+        use cmd = new SqlCommand("SELECT name FROM sys.schemas WHERE principal_id = 1 OR name like 'Mobile'", this)
         cmd.ExecuteQuery(fun record -> record.GetString(0)) |> Seq.toList
 
     member internal this.GetRoutines( schema, isSqlAzure) = 
