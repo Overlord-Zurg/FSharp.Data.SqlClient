@@ -59,6 +59,7 @@ type DesignTime private() =
         let m = ProvidedMethod(name, executeArgs, providedOutputType)
         
         m.InvokeCode <- fun exprArgs ->
+            System.Diagnostics.Debug.Assert(false, sprintf "%s.InvokeCode has been called, baby" name)
             let methodInfo = typeof<ISqlCommand>.GetMethod(name)
             let vals = mappedInputParamValues(exprArgs)
             let paramValues = Expr.NewArray( typeof<string * obj>, elements = vals)

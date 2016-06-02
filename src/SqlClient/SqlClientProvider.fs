@@ -171,16 +171,23 @@ type SqlProgrammabilityProvider(config : TypeProviderConfig) as this =
                 
                 cmdProvidedType.AddMembersDelayed <| fun() ->
                     [
+                        System.Diagnostics.Debug.Assert(false, sprintf "Adding routine %A" routine.Name)
                         use __ = conn.UseLocally()
                         let parameters = conn.GetParameters( routine, isSqlAzure, useReturnValue)
 
                         let commandText = routine.ToCommantText(parameters)
-                        let outputColumns = DesignTime.GetOutputColumns(conn, commandText, parameters, routine.IsStoredProc)
+                        let outputColumns =
+                            try DesignTime.GetOutputColumns(conn, commandText, parameters, routine.IsStoredProc) |> Choice1Of2
+                            with e -> Choice2Of2 e
+                                            
                         let rank = if routine.Type = ScalarValuedFunction then ResultRank.ScalarValue else ResultRank.Sequence
 
                         let hasOutputParameters = parameters |> List.exists (fun x -> x.Direction.HasFlag( ParameterDirection.Output))
 
-                        let returnType = DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters, unitsOfMeasurePerSchema)
+                        let output =
+                            match outputColumns with
+                            | Choice1Of2 outputColumns -> DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters, unitsOfMeasurePerSchema)
+                            | Choice2Of2 _ -> DesignTime.GetOutputTypes([], ResultType.DataReader, rank, hasOutputParameters, unitsOfMeasurePerSchema)
         
                         do  //Record
                             returnType.PerRow |> Option.iter (fun x -> cmdProvidedType.AddMember x.Provided)
@@ -192,7 +199,10 @@ type SqlProgrammabilityProvider(config : TypeProviderConfig) as this =
                             let expectedDataReaderColumns = 
                                 Expr.NewArray(
                                     typeof<string * string>, 
-                                    [ for c in outputColumns -> Expr.NewTuple [ Expr.Value c.Name; Expr.Value c.TypeInfo.ClrTypeFullName ] ]
+                                    match outputColumns with
+                                    | Choice1Of2 outputColumns ->
+                                        [ for c in outputColumns -> Expr.NewTuple [ Expr.Value c.Name; Expr.Value c.TypeInfo.ClrTypeFullName ] ]
+                                    | Choice2Of2 _ -> []
                                 )
 
                             <@@ {

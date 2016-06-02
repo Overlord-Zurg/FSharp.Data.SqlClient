@@ -308,7 +308,7 @@ type SqlConnection with
 
     member internal this.GetUserSchemas() = 
         use __ = this.UseLocally()
-        use cmd = new SqlCommand("SELECT name FROM sys.schemas WHERE principal_id = 1", this)
+        use cmd = new SqlCommand("SELECT name FROM sys.schemas WHERE principal_id = 1 or name like 'Mobile'", this)
         cmd.ExecuteQuery(fun record -> record.GetString(0)) |> Seq.toList
 
     member internal this.GetRoutines( schema, isSqlAzure) = 
@@ -571,7 +571,8 @@ type SqlConnection with
         
         use cmd = new SqlCommand(commandText, this, CommandType = commandType)
         for p in parameters do
-            cmd.Parameters.Add(p.Name, p.TypeInfo.SqlDbType) |> ignore
+            if p.Direction <> ParameterDirection.ReturnValue then
+                cmd.Parameters.Add(p.Name, p.TypeInfo.SqlDbType) |> ignore
         use reader = cmd.ExecuteReader(CommandBehavior.SchemaOnly)
         match reader.GetSchemaTable() with
         | null -> []
