@@ -184,7 +184,7 @@ type SqlProgrammabilityProvider(config : TypeProviderConfig) as this =
 
                         let hasOutputParameters = parameters |> List.exists (fun x -> x.Direction.HasFlag( ParameterDirection.Output))
 
-                        let output =
+                        let returnType =
                             match outputColumns with
                             | Choice1Of2 outputColumns -> DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters, unitsOfMeasurePerSchema)
                             | Choice2Of2 _ -> DesignTime.GetOutputTypes([], ResultType.DataReader, rank, hasOutputParameters, unitsOfMeasurePerSchema)

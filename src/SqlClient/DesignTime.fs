@@ -320,7 +320,8 @@ type DesignTime private() =
             try 
                 let commandType = if isStoredProcedure then CommandType.StoredProcedure else CommandType.Text
                 connection.FallbackToSETFMONLY(commandText, commandType, parameters) 
-            with :? SqlException ->
+            with :? SqlException as whyElse ->
+                raise whyElse
                 raise why
 
     static member internal ParseParameterInfo(cmd: SqlCommand) = 
