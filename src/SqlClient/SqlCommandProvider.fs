@@ -52,10 +52,11 @@ type SqlCommandProvider(config : TypeProviderConfig) as this =
                 ProvidedStaticParameter("SingleRow", typeof<bool>, false)   
                 ProvidedStaticParameter("ConfigFile", typeof<string>, "") 
                 ProvidedStaticParameter("AllParametersOptional", typeof<bool>, false) 
-                ProvidedStaticParameter("DataDirectory", typeof<string>, "") 
+                ProvidedStaticParameter("DataDirectory", typeof<string>, "")
+                ProvidedStaticParameter("ReturnValue", typeof<bool>, false)
             ],             
             instantiationFunction = (fun typeName args ->
-                let value = lazy this.CreateRootType(typeName, unbox args.[0], unbox args.[1], unbox args.[2], unbox args.[3], unbox args.[4], unbox args.[5], unbox args.[6])
+                let value = lazy this.CreateRootType(typeName, unbox args.[0], unbox args.[1], unbox args.[2], unbox args.[3], unbox args.[4], unbox args.[5], unbox args.[6], unbox args.[7])
                 cache.GetOrAdd(typeName, value)
             ) 
         )
@@ -70,6 +71,7 @@ type SqlCommandProvider(config : TypeProviderConfig) as this =
 <param name='AllParametersOptional'>If set all parameters become optional. NULL input values must be handled inside T-SQL.</param>
 <param name='ResolutionFolder'>A folder to be used to resolve relative file paths to *.sql script files at compile time. The default value is the folder that contains the project or script.</param>
 <param name='DataDirectory'>The name of the data directory that replaces |DataDirectory| in connection strings. The default value is the project or script directory.</param>
+<param name='ReturnValue'>If true, the statement will return both a result set (if applicable) and an integer return value.</param>
 """
 
         this.AddNamespace(nameSpace, [ providerType ])
@@ -81,7 +83,9 @@ type SqlCommandProvider(config : TypeProviderConfig) as this =
         |> defaultArg 
         <| base.ResolveAssembly args
 
-    member internal this.CreateRootType(typeName, sqlStatement, connectionStringOrName: string, resultType, singleRow, configFile, allParametersOptional, dataDirectory) = 
+    member internal this.CreateRootType(typeName, sqlStatement, connectionStringOrName: string, resultType, singleRow, configFile, allParametersOptional, dataDirectory, useReturnValue) = 
+
+        System.Diagnostics.Debugger.Launch() |> ignore
 
         if singleRow && not (resultType = ResultType.Records || resultType = ResultType.Tuples)
         then 
@@ -112,7 +116,7 @@ type SqlCommandProvider(config : TypeProviderConfig) as this =
             else []
 
         let rank = if singleRow then ResultRank.SingleRow else ResultRank.Sequence
-        let returnType = DesignTime.GetOutputTypes(outputColumns, resultType, rank, hasOutputParameters = false)
+        let returnType = DesignTime.GetOutputTypes(outputColumns, resultType, rank, useReturnValue)
         
         let cmdProvidedType = ProvidedTypeDefinition(assembly, nameSpace, typeName, Some typeof<``ISqlCommand Implementation``>, HideObjectMethods = true)
 
